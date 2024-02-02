@@ -1,0 +1,1056 @@
+---
+title: "Maternity Disease Progression Report"
+date: '01/23/2024'
+date-modified: '1/29/2024'
+author: Haixia Wang
+title-block-banner: "#63B8FF"
+format: 
+  html:
+    grid:
+      body-width: 1400px
+    code-fold: true
+    # code-tools: true # allow user to access the quarto source code
+    # df-print: kable # automatically convert printed table in kable format
+    # smooth-scroll: true
+    # theme: cerulean
+    toc: true # make table of content
+    # toc-location: right
+    # toc-title: Content
+    # toc-depth: 3
+    # number-sections: false
+    # code-overflow: wrap
+    # embed-resources: true
+    
+execute: 
+  cache: false # avoid re-rendering the same codes  # change this to false due to some issues of table not shown after rendered. 
+  warning: false
+  echo: false
+---
+
+
+```{css}
+  .quarto-title-block .quarto-title-banner {background-image:url(logos/logo_abcbs_stacked_medium.png);
+  .title{
+  color:#000000 !important;
+}
+  background-position: 65% 35%;
+  background-size: 15%;
+  background-repeat:no-repeat;
+  background-origin:content-box;
+  padding-right: 50px;
+}
+```
+
+# Libraries
+
+```{r echo=FALSE}
+#| output: fasle
+library(shiny)
+library(tidyverse)
+library(data.table)
+library(gt)
+library(igraph)
+library(DT)
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+
+# library(shinylive)
+```
+
+
+```{r}
+load(file = "envir_Objects.RData")
+```
+
+
+# Research questions
+
+-   Explore disease progression status of Maternity members for their pregnancy periods. 
+-   Cohort selection functionality 
+-   Duration of transitions among diseases
+-   Trajectories of Diseases and POS 
+
+# Data used
+
+-   subset of member weekly complete table, members who had Z3A codes in 2022. 
+-   timeline: for every member slice claims by her first conceive data to due date, if members left before their due dates, use their last date as end of observation instead.
+
+# Compound disease created
+To take care of multiple walks at one time point, we created a complied accumulated column: 'compound_disease' by following the following rules.
+
+-   ordered by week, members will keep picking up new popped up diseases and carry them all the way to the end of observation except for some terminate states, for instance, 'Exit','Miscarries','Delivery'. 
+-   we concatenate all diseases showed up in their pregnancy journey of each member as format of "D1+D2+.."  
+-   We fill all missing weeks that members do not have claims with all 0s, as we only exam their pregnancy time period. We have no knowledge of what is their health states outside of this range. 
+
+
+```{r eval=FALSE}
+X <- imputed_data %>% select(-cal_concieved_dtRoundWeek,-cal_due_dt_RoundWeek)  
+Y <- single_pregnancies_2022 %>% select(MEMBERID,cal_concieved_dtRoundWeek,cal_due_dt_RoundWeek)
+imputed_data <- X %>% left_join(Y, by='MEMBERID')  
+
+# set disease status to 1 since first occurrence
+disease_cols <- imputed_data %>% ungroup() %>% select(AIDS:PREGNANCY_ONGOING_UNCX) %>% colnames()
+
+imputed_data <- imputed_data %>% group_by(MEMBERID) %>% mutate(across(all_of(disease_cols), ~cummax(.x)))
+
+
+
+
+# merge with enrollment table to check any member exit the plan in pregnancy period
+temp2 <- imputed_data %>% 
+  select(MEMBERID,cal_concieved_dtRoundWeek,cal_due_dt_RoundWeek) %>% 
+  distinct() %>% 
+  left_join(MEMBER_WEEKLY_ENROLLMENT, by='MEMBERID',copy = TRUE) %>% 
+  mutate(TERMED_DuringPregnancy= ifelse(LASTDATE< cal_due_dt_RoundWeek,1,0)) 
+#   TERMED_DuringPregnancy     n
+#                    <dbl> <int>
+# 1                      0 27045
+# 2                      1  6141
+# 3                     NA    37
+# Conclusion: there are 6141/33223= 0.18 proportion of members exit the plan before their due dates. 
+
+
+# trim 'imputed_data' based on these members' last date instead of due dates. 
+
+trimed_imputed_data <- imputed_data %>% left_join(temp2 %>% filter(TERMED_DuringPregnancy==1) %>% select(MEMBERID,LASTDATE), by='MEMBERID') %>% filter(is.na(LASTDATE) | WEEK_ROUND<= LASTDATE) %>% mutate(LASTDATE= replace_na(LASTDATE, as.Date("9999-12-31"))) %>% mutate(TERMED_DuringPregnancy= ifelse(LASTDATE< cal_due_dt_RoundWeek,1,0))
+# 'trimed_imputed_data', this is the final trim table ready to make compound disease
+
+
+
+
+# each month create compound Disease column 
+# reshape to long format
+data <- trimed_imputed_data
+data <- data %>% 
+  group_by(MEMBERID) %>% 
+  arrange(WEEK_ROUND) %>% 
+  mutate(across(AIDS:PREGNANCY_ONGOING_UNCX, ~ifelse(cumsum(.)>0, 1,0)))
+
+data_long <- data %>% pivot_longer(cols = c(AIDS:PREGNANCY_ONGOING_UNCX),names_to = 'Disease',values_to = 'Flag') %>% 
+  filter(Flag==1)
+
+
+
+
+# create compound_disease column
+data_compound <- data_long %>% 
+  group_by(MEMBERID, WEEK_ROUND) %>% 
+  summarize(Flag_cnt= n(),compound_disease= paste(Disease, collapse='+')) %>% 
+  ungroup() %>% 
+  select(MEMBERID, WEEK_ROUND,compound_disease,Flag_cnt) %>% 
+  distinct()
+
+# merge back to include cases when a member are staying 'healthy'
+# assign compound_disease as 'Healthy' and Flag_cnt=0 for these cases
+temp <- trimed_imputed_data[,c('MEMBERID','WEEK_ROUND','TERMED_DuringPregnancy')] %>% left_join(data_compound, by=c('MEMBERID','WEEK_ROUND'))
+data_compound_all<- temp %>% replace_na(list(compound_disease='Healthy',Flag_cnt=0))
+
+# add 'Exit' to the last observation when member did exit the plan
+data_compound_all_ExitAdded <- data_compound_all %>% 
+  group_by(MEMBERID) %>% 
+  mutate(compound_disease=ifelse(TERMED_DuringPregnancy==1 & WEEK_ROUND==max(WEEK_ROUND), paste0(last(compound_disease),"+Exit"),compound_disease)) %>% relocate('TERMED_DuringPregnancy', .after = 'Flag_cnt')
+
+
+
+# Write table 
+library(pins)
+board <- board_connect()
+board %>% pin_write(
+  data_compound_all_ExitAdded,
+  # description
+  description = "Maternity members' pregnancy periods weekly claims which start from each member's conceive date and end with due date if a member did not drop from the plan before due date, otherwise use lastdate from eligibility table as last record instead. To take care of multiple walks, again we created a 'compound_disease' column. We also account for members did not have any CC flag cases and exit the plan cases by adding 'Healthy' & '+Exit' states. This table will give you a whole picture of pregnant members' accumulated disease progression.",
+  type = 'csv',
+  versioned = FALSE
+)
+
+
+
+```
+
+# Glimpse compound disease df
+```{r}
+sample <- datatable(data_compound_all_ExitAdded[1:100,], filter = 'top', caption= "Maternity Member Weekly with Compound Disease")
+sample
+```
+
+
+
+# Some Stats on Walks(Compound Diseases)
+```{r}
+top20_walks <- data_compound_all_ExitAdded %>% ungroup() %>% group_by(compound_disease) %>% summarise(Freq= n(), MbrCounts= n_distinct(MEMBERID)) %>% arrange(desc(MbrCounts)) %>% top_n(20) 
+
+top20_walks
+
+```
+
+
+
+
+
+
+# Bring in costs & static 
+
+```{r eval=FALSE}
+# merge tables: bring in cost & statics
+# library(pins)
+# board <- board_connect()
+# Master_Static <- pin_read(board, "dmpettis/Master_Static")
+# 
+# Maternity_Merged_CompoundCCs_Cost_Statics <- data_compound_all_ExitAdded %>% 
+#   left_join(imputed_data[,c('MEMBERID','WEEK_ROUND','ALLOWED','PAID')], by=c('MEMBERID','WEEK_ROUND')) %>% left_join(Master_Static[,c('Mbr_ID','Age_Group','Gender','Race','All_SVI_Cat','Rural_County_Cat')], by= c('MEMBERID'='Mbr_ID'))
+
+# show top 100 rows of the table in report
+# datatable(Maternity_Merged_CompoundCCs_Cost_Statics[1:100,], filter = 'top', caption= "Maternity Member Weekly merged table with CCs,Costs & Statics")
+
+
+
+
+```
+```{r}
+#| column: page-right
+#| fig-width: 10
+#| fig-height: 7
+
+
+# buckets distributions 
+
+Maternity_Merged_CompoundCCs_Cost_Statics <- rio::import(file = 'rOutput/Maternity_Merged_CompoundCCs_Cost_Statics.parquet')
+Demographics_only <- Maternity_Merged_CompoundCCs_Cost_Statics %>% select(MEMBERID,Age_Group,Gender,Race,All_SVI_Cat,Rural_County_Cat) %>% 
+  distinct() %>% 
+  mutate(Race_WhiteNonWhite= ifelse(Race=='White', 'White','Non_White')) %>% 
+  mutate(Age_Group= factor(Age_Group,levels= c("Age [0-18]","Age [19-30]","Age [31-40]","Age [41-50]","Age [51-60]","Age [>60]")),
+         Race_WhiteNonWhite= factor(Race_WhiteNonWhite, levels=c("White","Non_White")),
+         All_SVI_Cat= factor(All_SVI_Cat, levels=c("Low","Moderate","High","Very High")),
+         Rural_County_Cat= factor(Rural_County_Cat, levels= c("Very Rural","Rural", "Urban","Metro","Major City"))
+         )
+# Bar Plot for Age
+age_plot <- ggplot(Demographics_only, aes(x = Age_Group, fill = Age_Group)) +
+  geom_bar() +
+  theme_bw()+
+  theme(axis.text.x= element_text(angle = 45, hjust = 1))+
+  labs(title = "Age Distribution", x = "Age", y = "Count")
+# Bar Plot for Gender
+gender_plot <- ggplot(Demographics_only, aes(x = Gender, fill = Gender)) +
+  geom_bar() +
+  theme_bw()+
+  labs(title = "Gender Distribution", x = "Gender", y = "Count")
+# Bar Plot for Race
+race_plot <- ggplot(Demographics_only, aes(x = Race_WhiteNonWhite, fill = Race_WhiteNonWhite)) +
+  geom_bar() +
+  theme_bw()+
+  labs(title = "Race Distribution", x = "Race", y = "Count")
+# Bar Plot for SVI
+SVI_plot <- ggplot(Demographics_only, aes(x = All_SVI_Cat, fill = All_SVI_Cat)) +
+  geom_bar() +
+  theme_bw()+
+  labs(title = "All_SVI_Cat Distribution", x = "SVI", y = "Count") 
+# Bar Plot for Rural_Urban
+RuralUrban_plot <- ggplot(Demographics_only, aes(x = Rural_County_Cat, fill = Rural_County_Cat)) +
+  geom_bar() +
+  theme_bw()+
+  theme(axis.text.x= element_text(angle = 45, hjust = 1))+
+  labs(title = "RuralUrban Distribution", x = "Rural_County_Cat", y = "Count") 
+gridExtra::grid.arrange(age_plot, gender_plot, race_plot,SVI_plot,RuralUrban_plot, nrow = 3, padding= unit(50,"cm"))  # Adjust nrow as needed
+
+
+```
+
+
+# Costs stats
+The following dynamic table allow users to pick specific cohort by selecting values of groupers. PMPW cost (PAID & ALLOWED) will be calculated based on that. 
+Give it a try! 
+
+\vspace{2em}
+
+
+<iframe src="https://rconssweb01.abcbs.net/content/3e91c790-97fe-4e01-8544-6ce32375eed9" width="100%" height="400"></iframe>
+
+
+# lollipop plot show individual diease progression.
+## lollipop_prep
+```{r eval=FALSE}
+# structure table
+# for each member find start and end point of each disease
+# specify the disease columns
+disease_cols <- imputed_data %>% select(AIDS:PREGNANCY_ONGOING_UNCX) %>% colnames()
+
+
+
+
+# Find first and last week where disease = 1 for each member
+# Reshape the dataframe to long format
+imputed_data_long <- imputed_data %>% select(MEMBERID,WEEK_ROUND, disease_cols) %>% 
+  pivot_longer(cols = -c(MEMBERID, WEEK_ROUND), names_to = "disease", values_to = "status")
+
+# Calculate first and last week for each disease
+disease_timeline <- imputed_data_long %>%
+  filter(status==1) %>% 
+  data.table() %>% 
+  group_by(MEMBERID, disease) %>%
+  summarize(
+    firstweek = min(WEEK_ROUND[status == 1], na.rm = TRUE),
+    lastweek = max(WEEK_ROUND[status == 1], na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# View the result
+print(disease_timeline)
+
+
+# calculate median value on firstweek and lastweek
+disease_timeline_medianAcrossMbrs <- disease_timeline %>% 
+  group_by(disease) %>% 
+  summarise(Median_firstweek= as.Date(median(as.numeric(firstweek)), origin='1970-01-01'),
+            Median_lastweek= as.Date(median(as.numeric(lastweek)),origin='1970-01-01'))
+
+
+
+
+```
+
+## lollipop_make
+```{r}
+#| column: page-right
+#| fig-width: 10
+#| fig-height: 7
+# data 
+disease_timeline_medianAcrossMbrs <- read.csv("rOutput/disease_timeline_medianAcrossMbrs.csv")
+
+# Define Pregnancy Start and End Dates
+pregnancy_start <- as.Date("2022-01-03")  
+# the values are calculated from table of 'single_pregnancies_2022'
+pregnancy_end <- as.Date("2022-10-10")
+
+# bring in the median of start and end points of pregnancy 
+disease_timeline_medianAcrossMbrs$pregnancy_start <- as.Date("2022-01-03") 
+disease_timeline_medianAcrossMbrs$pregnancy_end <- as.Date("2022-10-10")
+
+# add gestation_weeks
+disease_timeline_medianAcrossMbrs <- disease_timeline_medianAcrossMbrs %>% 
+  mutate(
+  Gestation_weeks_start= round(as.numeric(difftime(Median_firstweek,pregnancy_start,units = 'weeks')),0),
+  Gestation_weeks_end= round(as.numeric(difftime(Median_lastweek,pregnancy_start,units = 'weeks')),0)
+  )
+
+
+# Adjust the factor levels to introduce space between each disease
+disease_timeline_medianAcrossMbrs$disease <- factor(disease_timeline_medianAcrossMbrs$disease, levels = disease_timeline_medianAcrossMbrs$disease)
+levels(disease_timeline_medianAcrossMbrs$disease) <- paste(levels(disease_timeline_medianAcrossMbrs$disease), "")
+
+# Create a lollipop chart
+ggplot(disease_timeline_medianAcrossMbrs, aes(y = disease, x = Gestation_weeks_start, color = disease))+
+  geom_segment(aes(xend = Gestation_weeks_end, yend = disease), size = 1) +
+  geom_point(size = 3) +
+  geom_point(aes(x = Gestation_weeks_end), size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 40, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "Disease Duration (Start and End Dates)",
+       x = "Gestation Weeks",
+       y = "Disease") +
+  theme(axis.title.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.position = "bottom",
+        axis.text.x= element_text(angle = 45,hjust = 1)) +
+  scale_color_viridis_d()+
+  guides(color = 'none')
+
+
+
+
+
+```
+# where each transition happened
+```{r eval=FALSE}
+# start with this table
+# 'data_compound_all_ExitAdded' 
+# Create a lagged disease column to identity transition
+data_compound_all_ExitAdded <- data_compound_all_ExitAdded %>% 
+  arrange(MEMBERID,WEEK_ROUND) %>% 
+  group_by(MEMBERID) %>% 
+  mutate(prev_disease= lag(compound_disease)) %>% 
+  filter(!is.na(prev_disease))
+
+
+
+# change name & add new column as prev_MONTH
+
+data_compound_all_ExitAdded_edit <- data_compound_all_ExitAdded %>% 
+  rename(curt_WEEK= WEEK_ROUND, curt_disease= compound_disease) %>% 
+  mutate(prev_WEEK= curt_WEEK %m-% weeks(1)) %>% 
+  relocate(prev_WEEK, .before = prev_disease) %>% 
+  group_by(MEMBERID,curt_WEEK,prev_WEEK) %>% 
+  mutate(tran_flag= ifelse(curt_disease==prev_disease,0,1))
+
+# merge with member weekly table complete to bring in POS info
+# check the flag of utilization for each member at transition point
+POS_transition <- data_compound_all_ExitAdded_edit %>% 
+  left_join(imputed_data %>% select(MEMBERID,WEEK_ROUND,ER,IP,OP,URGENT,OFFICE,TH,RENAL_POS), by=c('MEMBERID'= 'MEMBERID','curt_WEEK'='WEEK_ROUND'))
+# pin where each walk occurred( include both transition walk and non-transition walk)
+# define a function to get the names of columns where the flag of POS is 1. 
+get_POS_names <- function(row, col_names){
+  cols <- col_names[row==1]
+  paste(cols, collapse = "+")
+}
+
+binary_columns <- c('ER','IP','OP','URGENT','OFFICE','TH','RENAL_POS')
+
+# call function 
+POS_transition <- POS_transition %>% 
+  rowwise() %>% 
+  mutate(utilization_POS= get_POS_names(c_across(all_of(binary_columns)),binary_columns)) %>% 
+  ungroup()
+
+# fill all empty utilization_POS cases with "Healthy" which means no claims for these walks. 
+POS_transition$utilization_POS[POS_transition$utilization_POS==""] <- "Healthy"
+
+
+# stats on POS
+POS_Freq_tbl <- POS_transition %>% select(MEMBERID,curt_WEEK,utilization_POS) %>% group_by(utilization_POS) %>% summarise(Freq= n(),MbrCount=n_distinct(MEMBERID)) %>% arrange(desc(MbrCount))
+POS_Freq_tbl
+
+# find prev_POS for each member
+POS_transition_lagged <- POS_transition %>% 
+  rename(curt_POS=utilization_POS) %>% 
+  arrange(MEMBERID,curt_WEEK) %>% 
+  group_by(MEMBERID) %>% 
+  mutate(prev_POS= lag(curt_POS)) %>% 
+  filter(!is.na(prev_POS))
+
+# merge with static table 
+POS_transition_lagged_AddStatics <- POS_transition_lagged %>% left_join(Master_Static[,c('Mbr_ID','Age_Group','Gender','Race','All_SVI_Cat','Rural_County_Cat')], by= c('MEMBERID'='Mbr_ID'))
+
+# index transition as 1,2,3... 
+temp <- POS_transition_lagged_AddStatics %>% filter(tran_flag > 0) %>% group_by(MEMBERID) %>% arrange(MEMBERID, curt_WEEK) %>% mutate(tran_index = row_number()) %>% ungroup()
+# full join back and fill NAs of 'tran_index' column to 0s. 
+POS_transition_lagged_AddStatics_AddTransitionIndex <- temp[,c('MEMBERID','curt_WEEK','tran_index')] %>% full_join(POS_transition_lagged_AddStatics, by=c('MEMBERID','curt_WEEK')) %>% mutate(tran_index=ifelse(is.na(tran_index),0,tran_index))
+
+# this is final result table : 'POS_transition_lagged_AddStatics_AddTransitionIndex'
+
+```
+
+# Compute probs diseases
+```{r eval=FALSE}
+# get 'top5_intermediate_diseases', Healthy to top5 diseases
+# start from this table : 'POS_transition_lagged_AddStatics_AddTransitionIndex'
+
+temp <- POS_transition_lagged_AddStatics_AddTransitionIndex  %>% 
+  dplyr::filter(prev_disease=='Healthy' & curt_disease!='Healthy')
+top5_intermediate_diseases <- names(sort(table(temp$curt_disease), decreasing = TRUE)[1:5])
+top5_intermediate_diseases
+
+
+
+# get 'top5_final_diseases', each intermediate disease to next top5 diseases.
+# split each top 5 level1 disease into top5 level 2 diseases down the road. 
+ReturnTop5Level2_diseases_fun <- function(df, top5_intermediate_diseases) {
+  top5_level2_disease_next <- list()
+  for (disease in top5_intermediate_diseases) {
+    temp_tbl <- df %>% filter(prev_disease == as.character(disease) & curt_disease != as.character(disease))
+    top5_level2_disease_next[[disease]] <- names(sort(table(temp_tbl$curt_disease), decreasing = TRUE)[1:5])
+  }
+  return(top5_level2_disease_next)
+}
+
+
+# return 2nd level diseases at once by calling the function
+top5_final_diseases <- ReturnTop5Level2_diseases_fun(POS_transition_lagged_AddStatics_AddTransitionIndex ,top5_intermediate_diseases)
+top5_final_diseases
+
+
+
+```
+
+
+
+
+
+```{r eval=FALSE}
+# function
+
+Compute_Probs_fun <- function(Disease0, list){
+  temp <- POS_transition_lagged_AddStatics_AddTransitionIndex %>% 
+    filter(prev_disease==as.character(Disease0) & curt_disease!=as.character(Disease0)) %>% 
+    mutate(curt_disease= ifelse(curt_disease %in% list,curt_disease, "Others"))
+  # get probs for healthy to top5 level1 transitions
+  janitor::tabyl(temp$curt_disease) 
+}
+
+# Healthy to top 5 intermediate diseases
+list0 <- top5_intermediate_diseases
+Disease0='Healthy'
+Prob_0 <- Compute_Probs_fun(Disease0,list0)
+Prob_0 <- Prob_0 %>% 
+  rename('pathString'='temp$curt_disease','prob'='percent') 
+
+# level 2 : 
+# from 'PREGNANCY_ONGOING_UNCX' to top5_final_diseases
+list1 <- top5_final_diseases[[1]]
+Disease0=top5_intermediate_diseases[[1]]
+Prob_1 <- Compute_Probs_fun(Disease0,list1)
+Prob_1 <- Prob_1 %>% 
+  rename('pathString'='temp$curt_disease','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_diseases[[1]],"/",pathString))
+
+
+# from 'PREGNANCY_ONGOING_CX+PREGNANCY_ONGOING_UNCX' to top5_final_diseases
+list1 <- top5_final_diseases[[2]]
+Disease0=top5_intermediate_diseases[[2]]
+Prob_2 <- Compute_Probs_fun(Disease0,list1)
+Prob_2 <- Prob_2 %>% 
+  rename('pathString'='temp$curt_disease','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_diseases[[2]],"/",pathString))
+
+
+
+
+# from 'OBESITY+PREGNANCY_ONGOING_UNCX' to top5_final_diseases
+list1 <- top5_final_diseases[[3]]
+Disease0=top5_intermediate_diseases[[3]]
+Prob_3 <- Compute_Probs_fun(Disease0,list1)
+Prob_3 <- Prob_3 %>% 
+  rename('pathString'='temp$curt_disease','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_diseases[[3]],"/",pathString))
+
+
+
+# from 'BH' to top5_final_diseases
+list1 <- top5_final_diseases[[4]]
+Disease0=top5_intermediate_diseases[[4]]
+Prob_4 <- Compute_Probs_fun(Disease0,list1)
+Prob_4 <- Prob_4 %>% 
+  rename('pathString'='temp$curt_disease','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_diseases[[4]],"/",pathString))
+
+# from 'COVID' to top5_final_diseases
+list1 <- top5_final_diseases[[5]]
+Disease0=top5_intermediate_diseases[[5]]
+Prob_5 <- Compute_Probs_fun(Disease0,list1)
+Prob_5 <- Prob_5 %>% 
+  rename('pathString'='temp$curt_disease','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_diseases[[5]],"/",pathString))
+
+
+
+# make a df for tree diagram 
+df_4tree_prob_disease <- bind_rows(Prob_0,Prob_1,Prob_2,Prob_3,Prob_4,Prob_5) %>% 
+  select(-n) %>% 
+  mutate(prob= round(prob,3))
+
+```
+
+
+```{r Disease_map}
+#| column: page-right
+#| fig-width: 10
+#| fig-height: 7
+
+# Tree starts here
+## draw tree with probs-----
+
+library(data.tree)
+# step1
+# prob_data <- readr::read_csv("~/Survival analysis/data/DataKwery Tree Diagram - Sheet1.csv")
+# reference 
+# https://www.datakwery.com/post/tree-diagrams-in-r/
+# prob_data <- read_csv("https://docs.google.com/spreadsheets/d/e/2PACX-1vQWc07o1xTNCJcGhw-tWYAnD3xPCjS0_jE4CIBR-rp5ff3flVGJQf2K24bJ5FE-DauQvLrtB8wWJNuc/pub?gid=0&single=true&output=csv")
+# this link got blocked,downloaded using my computer and loaded into my project.
+
+# prob_data <- df_4tree_prob_disease
+df_4tree_prob_disease <- rio::import(file = 'rOutput/df_4tree_prob_disease.parquet')
+prob_data <- df_4tree_prob_disease
+# prob_data <- df_4tree_prob_disease %>% filter(!grepl("BH", pathString) & !grepl("COVID",pathString))
+# step2
+prob_data <- prob_data %>%  mutate(tree_level = str_count(string = pathString, pattern = "/") + 1,
+                                   tree_group = str_replace(string = pathString, pattern = "/.*", replacement = ""),
+                                   node_type = "decision_node"
+)
+
+max_tree_level <- max(prob_data$tree_level, na.rm = T) 
+
+
+# step3
+parent_lookup <- prob_data %>% distinct(pathString, prob) # get distinct probabilities to facilitate finding parent node probability
+
+for (i in 1:(max_tree_level -  1)) { # loop through all tree layers to get all immidiate parent probabilities (to calculate cumulative prob)
+  
+  names(parent_lookup)[1] <-paste0("parent",i)
+  names(parent_lookup)[2] <-paste0("parent_prob",i)
+  
+  for (j in 1:i) {
+    
+    if (j == 1)  prob_data[[paste0("parent",i)]] <- sub("/[^/]+$", "", prob_data$pathString)
+    else if (j  > 1) prob_data[[paste0("parent",i)]] <- sub("/[^/]+$", "", prob_data[[paste0("parent",i)]])
+  }
+  
+  prob_data <- prob_data %>% left_join(parent_lookup, by = paste0("parent",i))
+  
+}
+
+
+prob_data$overall_prob <- apply(prob_data %>% select(contains("prob"))  , 1, prod, na.rm = T)  # calculate cumulative probability   
+
+
+# step4
+terminal_data <- prob_data %>%  filter(tree_level == max_tree_level) %>% # create new rows that will display terminal/final step calulcations on the tree
+  mutate(node_type = 'terminal',
+         pathString = paste0(pathString, "/overall"),
+         prob = NA,
+         tree_level = max_tree_level + 1)
+
+start_node <- "Healthy" # name the root node
+
+prob_data = bind_rows(prob_data, terminal_data) %>%  # bind everything together 
+  mutate(pathString = paste0(start_node,"/",pathString),
+         overall_prob = ifelse(node_type == 'terminal', overall_prob, NA),
+         prob_rank = rank(-overall_prob, ties.method = "min", na.last = "keep"))
+
+prob_data = bind_rows(prob_data, data.frame(pathString = start_node, node_type = 'start', tree_level = 0)) %>% # add one new row to serve as the start node label
+  select(-contains("parent"))
+
+
+# step5
+make_my_tree <- function(mydf, display_level = NULL, show_rank = FALSE, direction = "LR") {
+  
+  if (!is.null(display_level) ) {
+    mydf <- mydf %>% filter(tree_level <= display_level)
+    
+  }
+  
+  mytree <- as.Node(mydf) 
+  
+  GetEdgeLabel <- function(node) switch(node$node_type, node$prob)
+  
+  GetNodeShape <- function(node) switch(node$node_type, start = "box", node_decision = "circle", terminal = "none")
+  
+  
+  GetNodeLabel <- function(node) switch(node$node_type, 
+                                        terminal = ifelse(show_rank  == TRUE, paste0("Prob: ", node$overall_prob,"\nRank: ", node$prob_rank),
+                                                          paste0("Prob: ", node$overall_prob)),
+                                        node$node_name)
+  
+  SetEdgeStyle(mytree, fontname = 'helvetica', label = GetEdgeLabel)
+  
+  SetNodeStyle(mytree, fontname = 'helvetica', label = GetNodeLabel, shape = GetNodeShape)
+  
+  SetGraphStyle(mytree, rankdir = direction) 
+  
+  plot(mytree)
+  
+}
+
+# step6
+result_plot <- make_my_tree(prob_data, show_rank = TRUE)
+# make_my_tree(prob_data)
+# make_my_tree(prob_data, display_level = 1)
+# make_my_tree(prob_data, display_level = 2)
+
+result_plot
+
+
+
+```
+
+# Save tree plots
+```{r eval=FALSE}
+## Save the tree plot-----
+# Save the widget as an HTML file
+library(htmlwidgets)
+library(plotly)
+# saveWidget(as_widget(result_plot), "rOutput/treeDiagram_prob_disease.html")
+saveWidget(as_widget(result_plot), "rOutput/treeDiagram_prob_disease.html")
+```
+
+
+
+
+# Compute probs POS
+```{r eval=FALSE}
+# get 'top5_intermediate_POS', Healthy to top5 POS
+# start from this table : 'POS_transition_lagged_AddStatics_AddTransitionIndex'
+
+temp <- POS_transition_lagged_AddStatics_AddTransitionIndex  %>% 
+  dplyr::filter(prev_POS=='Healthy' & curt_POS!='Healthy')
+top5_intermediate_POS <- names(sort(table(temp$curt_POS), decreasing = TRUE)[1:5])
+top5_intermediate_POS
+
+
+
+# get 'top5_final_POS', each intermediate POS to next top5 POS.
+# split each top 5 level1 POS into top5 level 2 POS down the road. 
+ReturnTop5Level2_POS_fun <- function(df, top5_intermediate_POS) {
+  top5_level2_POS_next <- list()
+  for (POS in top5_intermediate_POS) {
+    temp_tbl <- df %>% filter(prev_POS == as.character(POS) & curt_POS != as.character(POS))
+    top5_level2_POS_next[[POS]] <- names(sort(table(temp_tbl$curt_POS), decreasing = TRUE)[1:5])
+  }
+  return(top5_level2_POS_next)
+}
+
+
+# return 2nd level POS at once by calling the function
+top5_final_POS <- ReturnTop5Level2_POS_fun(POS_transition_lagged_AddStatics_AddTransitionIndex ,top5_intermediate_POS)
+top5_final_POS
+
+
+
+```
+
+```{r eval=FALSE}
+
+
+# function
+
+Compute_Probs_fun <- function(POS0, list){
+  temp <- POS_transition_lagged_AddStatics_AddTransitionIndex %>% 
+    filter(prev_POS==as.character(POS0) & curt_POS!=as.character(POS0)) %>% 
+    mutate(curt_POS= ifelse(curt_POS %in% list,curt_POS, "Others"))
+  # get probs for healthy to top5 level1 transitions
+  janitor::tabyl(temp$curt_POS) 
+}
+
+# Healthy to top 5 intermediate POS
+list0 <- top5_intermediate_POS
+POS0='Healthy'
+Prob_0 <- Compute_Probs_fun(POS0,list0)
+Prob_0 <- Prob_0 %>% 
+  rename('pathString'='temp$curt_POS','prob'='percent') 
+
+# level 2 : 
+# from 'OFFICE' to top5_final_POS
+list1 <- top5_final_POS[[1]]
+POS0=top5_intermediate_POS[[1]]
+Prob_1 <- Compute_Probs_fun(POS0,list1)
+Prob_1 <- Prob_1 %>% 
+  rename('pathString'='temp$curt_POS','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_POS[[1]],"/",pathString))
+
+
+# from 'OP' to top5_final_POS
+list1 <- top5_final_POS[[2]]
+POS0=top5_intermediate_POS[[2]]
+Prob_2 <- Compute_Probs_fun(POS0,list1)
+Prob_2 <- Prob_2 %>% 
+  rename('pathString'='temp$curt_POS','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_POS[[2]],"/",pathString))
+
+
+
+
+# from 'OP+OFFICE' to top5_final_POS
+list1 <- top5_final_POS[[3]]
+POS0=top5_intermediate_POS[[3]]
+Prob_3 <- Compute_Probs_fun(POS0,list1)
+Prob_3 <- Prob_3 %>% 
+  rename('pathString'='temp$curt_POS','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_POS[[3]],"/",pathString))
+
+
+
+# from 'ER' to top5_final_POS
+list1 <- top5_final_POS[[4]]
+POS0=top5_intermediate_POS[[4]]
+Prob_4 <- Compute_Probs_fun(POS0,list1)
+Prob_4 <- Prob_4 %>% 
+  rename('pathString'='temp$curt_POS','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_POS[[4]],"/",pathString))
+
+# from 'IP' to top5_final_POS
+list1 <- top5_final_POS[[5]]
+POS0=top5_intermediate_POS[[5]]
+Prob_5 <- Compute_Probs_fun(POS0,list1)
+Prob_5 <- Prob_5 %>% 
+  rename('pathString'='temp$curt_POS','prob'='percent') %>% 
+  mutate(pathString= paste0(top5_intermediate_POS[[5]],"/",pathString))
+
+
+
+# make a df for tree diagram 
+df_4tree_prob_POS <- bind_rows(Prob_0,Prob_1,Prob_2,Prob_3,Prob_4,Prob_5) %>% 
+  select(-n) %>% 
+  mutate(prob= round(prob,3))
+
+# pass this to make tree 'df_4tree_prob_POS'
+```
+
+```{r pos_map}
+
+#| column: page-right
+#| fig-width: 14
+#| fig-height: 10
+
+
+# Tree starts here
+## draw tree with probs-----
+
+library(data.tree)
+# step1
+# prob_data <- readr::read_csv("~/Survival analysis/data/DataKwery Tree Diagram - Sheet1.csv")
+# reference 
+# https://www.datakwery.com/post/tree-diagrams-in-r/
+# prob_data <- read_csv("https://docs.google.com/spreadsheets/d/e/2PACX-1vQWc07o1xTNCJcGhw-tWYAnD3xPCjS0_jE4CIBR-rp5ff3flVGJQf2K24bJ5FE-DauQvLrtB8wWJNuc/pub?gid=0&single=true&output=csv")
+# this link got blocked,downloaded using my computer and loaded into my project.
+
+# prob_data <- df_4tree_prob_disease
+df_4tree_prob_POS <- rio::import(file = 'rOutput/df_4tree_prob_POS.parquet')
+prob_data <- df_4tree_prob_POS
+
+# step2
+prob_data <- prob_data %>%  mutate(tree_level = str_count(string = pathString, pattern = "/") + 1,
+                                   tree_group = str_replace(string = pathString, pattern = "/.*", replacement = ""),
+                                   node_type = "decision_node"
+)
+
+max_tree_level <- max(prob_data$tree_level, na.rm = T) 
+
+
+# step3
+parent_lookup <- prob_data %>% distinct(pathString, prob) # get distinct probabilities to facilitate finding parent node probability
+
+for (i in 1:(max_tree_level -  1)) { # loop through all tree layers to get all immidiate parent probabilities (to calculate cumulative prob)
+  
+  names(parent_lookup)[1] <-paste0("parent",i)
+  names(parent_lookup)[2] <-paste0("parent_prob",i)
+  
+  for (j in 1:i) {
+    
+    if (j == 1)  prob_data[[paste0("parent",i)]] <- sub("/[^/]+$", "", prob_data$pathString)
+    else if (j  > 1) prob_data[[paste0("parent",i)]] <- sub("/[^/]+$", "", prob_data[[paste0("parent",i)]])
+  }
+  
+  prob_data <- prob_data %>% left_join(parent_lookup, by = paste0("parent",i))
+  
+}
+
+
+prob_data$overall_prob <- apply(prob_data %>% select(contains("prob"))  , 1, prod, na.rm = T)  # calculate cumulative probability   
+
+
+# step4
+terminal_data <- prob_data %>%  filter(tree_level == max_tree_level) %>% # create new rows that will display terminal/final step calulcations on the tree
+  mutate(node_type = 'terminal',
+         pathString = paste0(pathString, "/overall"),
+         prob = NA,
+         tree_level = max_tree_level + 1)
+
+start_node <- "Healthy" # name the root node
+
+prob_data = bind_rows(prob_data, terminal_data) %>%  # bind everything together 
+  mutate(pathString = paste0(start_node,"/",pathString),
+         overall_prob = ifelse(node_type == 'terminal', overall_prob, NA),
+         prob_rank = rank(-overall_prob, ties.method = "min", na.last = "keep"))
+
+prob_data = bind_rows(prob_data, data.frame(pathString = start_node, node_type = 'start', tree_level = 0)) %>% # add one new row to serve as the start node label
+  select(-contains("parent"))
+
+
+# step5
+make_my_tree <- function(mydf, display_level = NULL, show_rank = FALSE, direction = "LR") {
+  
+  if (!is.null(display_level) ) {
+    mydf <- mydf %>% filter(tree_level <= display_level)
+    
+  }
+  
+  mytree <- as.Node(mydf) 
+  
+  GetEdgeLabel <- function(node) switch(node$node_type, node$prob)
+  
+  GetNodeShape <- function(node) switch(node$node_type, start = "box", node_decision = "circle", terminal = "none")
+  
+  
+  GetNodeLabel <- function(node) switch(node$node_type, 
+                                        terminal = ifelse(show_rank  == TRUE, paste0("Prob: ", node$overall_prob,"\nRank: ", node$prob_rank),
+                                                          paste0("Prob: ", node$overall_prob)),
+                                        node$node_name)
+  
+  SetEdgeStyle(mytree, fontname = 'helvetica', label = GetEdgeLabel)
+  
+  SetNodeStyle(mytree, fontname = 'helvetica', label = GetNodeLabel, shape = GetNodeShape)
+  
+  SetGraphStyle(mytree, rankdir = direction) 
+  
+  plot(mytree)
+  
+}
+
+# step6
+result_plot_POS <- make_my_tree(prob_data, show_rank = TRUE)
+# make_my_tree(prob_data)
+# make_my_tree(prob_data, display_level = 1)
+# make_my_tree(prob_data, display_level = 2)
+
+result_plot_POS
+
+
+
+
+```
+
+
+
+# Length of transitions
+We computed the summary stats of lengths of consecutive pairs of transitions by time order that each transition occurred across all members.
+
+```{r length_transitions}
+#| column: page-right
+#| fig-width: 10
+#| fig-height: 7
+
+
+# structure table 
+# start with this table 'POS_transition_lagged_AddStatics_AddTransitionIndex'
+# bring in conceived date and due date to compute gestation age
+POS_transition_lagged_AddStatics_AddTransitionIndex_GestationAdded <- POS_transition_lagged_AddStatics_AddTransitionIndex %>% left_join(single_pregnancies_2022[,c('MEMBERID','cal_concieved_dtRoundWeek','cal_due_dt_RoundWeek')], by= 'MEMBERID') %>% 
+mutate(
+  Gestation_Weeks= as.numeric(difftime(curt_WEEK,cal_concieved_dtRoundWeek,units = 'weeks')),     TRIMESTER= case_when(
+    between(Gestation_Weeks,0,13) ~ 'Trimester_1',
+    between(Gestation_Weeks,14,26) ~ 'Trimester_2',
+    between(Gestation_Weeks,27,40) ~ 'Trimester_3')
+) 
+
+
+# find first week for each member
+df4Transition_Lengths <- POS_transition_lagged_AddStatics_AddTransitionIndex_GestationAdded
+first_weeks <- df4Transition_Lengths %>% group_by(MEMBERID) %>% summarise(first_week= min(curt_WEEK))
+
+transition_weeks <-df4Transition_Lengths %>% 
+  filter(tran_flag==1) %>% 
+  group_by(MEMBERID, tran_index) %>% 
+  summarise(transition_week= first(curt_WEEK)) %>% 
+  pivot_wider(names_from = tran_index, values_from = transition_week, names_prefix = 'transition_')
+  
+combined_TransitionLenght_df <- first_weeks %>% left_join(transition_weeks, by='MEMBERID')
+
+
+# add transition detail
+transition_details <- df4Transition_Lengths %>% 
+  filter(tran_flag==1) %>% 
+  group_by(MEMBERID, tran_index) %>% 
+  reframe(transiton_detail= paste(prev_disease, "->", curt_disease)) %>% 
+  pivot_wider(names_from = tran_index, values_from =transiton_detail,names_glue = "transition_{tran_index}_details" )
+
+
+# final table combined
+final_TransitionLenght_df <- combined_TransitionLenght_df %>% left_join(transition_details, by='MEMBERID')
+
+
+# calcualte distance/length between each consecutive transition. 
+# define a function to calculate the difference , handling NAs. 
+calculate_diff <- function(cur,prev){
+  if(is.na(cur)| is.na(prev)){
+    return(NA)
+  } else{
+    return(as.numeric(difftime(cur,prev,units = 'weeks')))
+  }
+}
+
+
+final_TransitionLengths <- final_TransitionLenght_df %>% 
+  ungroup() %>% 
+  select(MEMBERID,first_week:transition_10) %>% 
+  group_by(MEMBERID) %>% 
+  mutate(
+    diff_1= calculate_diff(transition_1 ,first_week),
+    diff_2= calculate_diff(transition_2 ,transition_1),
+    diff_3= calculate_diff(transition_3 ,transition_2),
+    diff_4= calculate_diff(transition_4 ,transition_3),
+    diff_5= calculate_diff(transition_5 ,transition_4),
+    diff_6= calculate_diff(transition_6 ,transition_5),
+    diff_7= calculate_diff(transition_7 ,transition_6),
+    diff_8= calculate_diff(transition_8 ,transition_7),
+    diff_9= calculate_diff(transition_9 ,transition_8),
+    diff_10= calculate_diff(transition_10 ,transition_9),
+    
+  ) %>% 
+  left_join(transition_details, by='MEMBERID')
+  
+# stats on lengths
+df4LengthStats <- final_TransitionLengths %>% select(MEMBERID,starts_with("diff_"))
+
+# define function 
+summary_stats_with_MbrCounts <- function(x){
+  data.frame(
+    min=min(x, na.rm = TRUE),
+    max=max(x, na.rm = TRUE),
+    mean=round(mean(x, na.rm = TRUE),2),
+    median=round(median(x, na.rm = TRUE),2),
+    sd=round(sd(x, na.rm = TRUE),2),
+    unique_Mbrs= sum(!is.na(x))
+  )
+}
+
+summary_tbl_TransitionLengths <- purrr::map_df(df4LengthStats[-1], summary_stats_with_MbrCounts, .id = "variable")
+
+
+summary_tbl_TransitionLengths <- summary_tbl_TransitionLengths %>% datatable(caption= htmltools::tags$caption(
+  style= "font-weight: bold; font-size: 20; text-align: center", "Stats: Length of consecutive transitions in unit weeks"
+))
+summary_tbl_TransitionLengths
+
+```
+## Top 20 transition states: from initial state to 1st transition state 
+```{r transition0_1}
+table(unlist(final_TransitionLenght_df$transition_1_details)) %>% as.data.frame() %>% arrange(desc(Freq)) %>% head(20) %>% datatable()
+
+
+```
+## Transition 1 to 2 
+```{r transition1_2}
+
+#| column: page-right
+#| fig-width: 15
+#| fig-height: 7
+table(unlist(final_TransitionLenght_df$transition_2_details)) %>% as.data.frame() %>% arrange(desc(Freq)) %>% head(20) %>% datatable()
+
+```
+
+
+
+
+
+
+
+# Save & load 
+```{r eval=FALSE}
+save(
+  single_pregnancies_2022,
+  imputed_data,
+  trimed_imputed_data,
+  data_compound_all,
+  data_compound_all_ExitAdded,
+  Maternity_Merged_CompoundCCs_Cost_Statics,
+  disease_timeline_medianAcrossMbrs,
+  df_4tree_prob_disease,
+  df_4tree_prob_POS,
+  POS_transition_lagged_AddStatics_AddTransitionIndex,
+  final_TransitionLenght_df,
+  summary_tbl_TransitionLengths,
+  file = "envir_Objects.RData"
+  )
+
+load(file = "envir_Objects.RData")
+
+```
+
+# pin tables 
+
+```{r eval=FALSE}
+library(pins)
+board <- board_connect()
+board %>% pin_write(
+  Maternity_Merged_CompoundCCs_Cost_Statics,
+  # description
+  description = "Maternity members' pregnancy periods weekly claims which start from each member's conceive date and end with due date if a member did not drop from the plan before due date, otherwise use lastdate from eligibility table as last record instead. \nTo take care of multiple walks, again we created a 'compound_disease' column. We also account for members did not have any CC flag cases and exit the plan cases by adding 'Healthy' & '+Exit' states. This table will give you a whole picture of pregnant members' accumulated disease progression.\nUpdated: merged with master static table to bring in demographics and SDOH, plus costs.",
+  type = 'csv',
+  versioned = FALSE
+)
+
+
+
+```
+
+
